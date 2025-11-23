@@ -10,12 +10,19 @@ import * as Constants from './physics/constants';
 
 /**
  * Control mode enum
+ *
+ * SPINNING_HOVER: Symmetric handedness [1,1,1,1], accepts spin, attitude+position control
+ * POSITION_ATTITUDE: Symmetric handedness, position-only control, lets attitude evolve
+ * ALTERNATING_HOVER: Alternating handedness [1,-1,-1,1], full attitude+position control (stable, oscillatory)
  */
 enum ControlMode {
     MANUAL = 'manual',
     ATTITUDE = 'attitude',
     POSITION = 'position',
-    HOVER = 'hover'
+    HOVER = 'hover',
+    SPINNING_HOVER = 'spinning_hover',      // Symmetric handedness, accepts spin
+    POSITION_ATTITUDE = 'position_attitude', // Symmetric handedness, position-only (was ORBIT_HOVER)
+    ALTERNATING_HOVER = 'alternating_hover'  // Alternating handedness, full control
 }
 
 /**
@@ -29,7 +36,11 @@ class TetraCopterApp {
     // Controllers
     private attitudeController!: AttitudeController;
     private positionController!: PositionController;
-    private controlMode: ControlMode = ControlMode.HOVER;  // Start in hover mode
+    private controlMode: ControlMode = ControlMode.SPINNING_HOVER;  // Start in spinning hover mode
+
+    // Spinning reference frame tracking
+    private spinningReferenceAngle: number = 0;  // Current angle of the spinning reference
+    private estimatedSpinRate: number = 0;       // Estimated spin rate from thrust
 
     // Simulation state
     private isRunning = true;
@@ -48,10 +59,17 @@ class TetraCopterApp {
         angularVel: HTMLElement;
         motorSliders: HTMLInputElement[];
         motorValues: HTMLElement[];
+        modeIndicator: HTMLElement;
+        hoverBtn: HTMLElement;
+        manualBtn: HTMLElement;
+        posAttBtn: HTMLElement;
     };
 
-    // Motor control (for manual mode) - single input per motor
+    // Motor control - single input per motor
     private motorThrusts = [0, 0, 0, 0];
+
+    // Track if user is currently dragging a slider
+    private sliderBeingDragged: number | null = null;
 
     constructor() {
         this.initPhysics();
@@ -114,29 +132,55 @@ class TetraCopterApp {
             orientation: document.getElementById('orientation')!,
             angularVel: document.getElementById('angularVel')!,
             motorSliders: [],
-            motorValues: []
+            motorValues: [],
+            modeIndicator: document.getElementById('currentMode')!,
+            hoverBtn: document.getElementById('hoverBtn')!,
+            manualBtn: document.getElementById('manualBtn')!,
+            posAttBtn: document.getElementById('posAttBtn')!
         };
 
         // Initialize motor controls
         for (let i = 1; i <= 4; i++) {
             const slider = document.getElementById(`motor${i}`) as HTMLInputElement;
             const value = document.getElementById(`motor${i}val`) as HTMLElement;
+            const motorIndex = i - 1;
 
             this.uiElements.motorSliders.push(slider);
             this.uiElements.motorValues.push(value);
 
-            // Add slider event listener
+            // Track when user starts dragging
+            slider.addEventListener('mousedown', () => {
+                this.sliderBeingDragged = motorIndex;
+            });
+
+            slider.addEventListener('touchstart', () => {
+                this.sliderBeingDragged = motorIndex;
+            });
+
+            // Track when user stops dragging
+            slider.addEventListener('mouseup', () => {
+                this.sliderBeingDragged = null;
+            });
+
+            slider.addEventListener('touchend', () => {
+                this.sliderBeingDragged = null;
+            });
+
+            // Apply slider value while dragging
             slider.addEventListener('input', () => {
                 const thrust = parseFloat(slider.value);
-                this.motorThrusts[i - 1] = thrust;
+                this.motorThrusts[motorIndex] = thrust;
                 value.textContent = thrust.toFixed(1);
 
-                // Only apply manual control in manual mode
-                if (this.controlMode === ControlMode.MANUAL) {
-                    this.drone.setMotorInputs(this.motorThrusts);
-                }
+                // Always apply motor input when user drags (override controller momentarily)
+                this.drone.setMotorInputs(this.motorThrusts);
             });
         }
+
+        // Also handle mouse leaving the slider while dragging
+        document.addEventListener('mouseup', () => {
+            this.sliderBeingDragged = null;
+        });
     }
 
     private initEventHandlers(): void {
@@ -145,19 +189,19 @@ class TetraCopterApp {
             this.reset();
         });
 
-        // Hover button - now enables PID hover mode
+        // Hover button
         document.getElementById('hoverBtn')?.addEventListener('click', () => {
             this.enableHoverMode();
         });
 
-        // Spin button
-        document.getElementById('spinBtn')?.addEventListener('click', () => {
-            this.startSpin();
+        // Manual button - now "Stable" mode with alternating handedness
+        document.getElementById('manualBtn')?.addEventListener('click', () => {
+            this.enableAlternatingMode();
         });
 
-        // Flip button - switch to manual
-        document.getElementById('flipBtn')?.addEventListener('click', () => {
-            this.setManualMode();
+        // Position+Attitude button (was Orbit)
+        document.getElementById('posAttBtn')?.addEventListener('click', () => {
+            this.enablePositionAttitudeMode();
         });
 
         // Keyboard controls
@@ -188,7 +232,13 @@ class TetraCopterApp {
                     break;
                 case 'm':
                 case 'M':
-                    this.setManualMode();
+                case 's':
+                case 'S':
+                    this.enableAlternatingMode();
+                    break;
+                case 'p':
+                case 'P':
+                    this.enablePositionAttitudeMode();
                     break;
                 // Arrow keys to nudge target position
                 case 'ArrowUp':
@@ -274,24 +324,59 @@ class TetraCopterApp {
      * Run the active controller and apply motor commands
      */
     private runController(): void {
+        // If user is dragging a slider, don't run controller (let them override)
+        if (this.sliderBeingDragged !== null) {
+            return;
+        }
+
         const state = this.drone.state;
 
-        if (this.controlMode === ControlMode.HOVER || this.controlMode === ControlMode.POSITION) {
-            // Position control mode: compute desired force and orientation
+        if (this.controlMode === ControlMode.SPINNING_HOVER) {
+            // SPINNING HOVER MODE: Accept the spin, track a rotating reference frame
+
+            // Position control: compute desired force
             const desiredForceWorld = this.positionController.computeDesiredForce(state);
             const desiredForceBody = state.worldToBody(desiredForceWorld);
 
-            // For this underactuated system, keep orientation upright (identity)
-            // Don't try to tilt - the coupling makes it unstable
-            this.attitudeController.setTargetOrientation(Quaternion.identity());
+            // Estimate the yaw torque that will be induced by current thrust
+            // With symmetric handedness, thrust creates unavoidable yaw torque
+            const allocation = this.drone.getAllocation();
+            const totalThrust = desiredForceBody.magnitude();
+            const yawTorque = allocation.getHoverYawTorque(totalThrust);
 
-            // Attitude control: compute torque to reach desired orientation
+            // Estimate spin rate: τ = I * dω/dt
+            // At quasi-steady state, integrate to track accumulated spin
+            const Izz = Constants.DRONE_INERTIA.get(2, 2);
+            const angularAccel = yawTorque / Izz;
+
+            // Instead of fighting the spin, track the actual current yaw
+            // The target orientation should match the drone's current yaw, but keep upright
+            const currentEuler = state.getEulerAngles();
+
+            // Target: upright (roll=0, pitch=0) but match current yaw
+            // This way we're not fighting the yaw, only stabilizing roll/pitch
+            const targetOrientation = Quaternion.fromEuler(0, 0, currentEuler.yaw);
+            this.attitudeController.setTargetOrientation(targetOrientation);
+
+            // Attitude control: compute torque to stabilize roll/pitch only
             const desiredTorque = this.attitudeController.computeTorque(state);
 
-            // Apply through allocation matrix (least-squares for underactuated)
-            this.drone.setMotorInputsFromWrench(desiredForceBody, desiredTorque);
+            // Zero out yaw torque request - we're accepting whatever yaw happens
+            desiredTorque.z = 0;
 
-            // Update UI to show actual motor values
+            // Apply through allocation matrix
+            this.drone.setMotorInputsFromWrench(desiredForceBody, desiredTorque);
+            this.updateMotorUI();
+
+        } else if (this.controlMode === ControlMode.HOVER || this.controlMode === ControlMode.POSITION) {
+            // Original hover mode (will be unstable with symmetric handedness)
+            const desiredForceWorld = this.positionController.computeDesiredForce(state);
+            const desiredForceBody = state.worldToBody(desiredForceWorld);
+
+            this.attitudeController.setTargetOrientation(Quaternion.identity());
+            const desiredTorque = this.attitudeController.computeTorque(state);
+
+            this.drone.setMotorInputsFromWrench(desiredForceBody, desiredTorque);
             this.updateMotorUI();
 
         } else if (this.controlMode === ControlMode.ATTITUDE) {
@@ -303,15 +388,76 @@ class TetraCopterApp {
 
             this.drone.setMotorInputsFromWrench(bodyForce, desiredTorque);
             this.updateMotorUI();
+
+        } else if (this.controlMode === ControlMode.POSITION_ATTITUDE) {
+            // POSITION+ATTITUDE MODE: Position-only control, let attitude evolve naturally
+            // With symmetric handedness, any force creates torque - we just accept it
+            // This should create the "orbit dance" as position and attitude interact
+
+            // Position control (world frame) - same as spinning hover
+            const desiredForceWorld = this.positionController.computeDesiredForce(state);
+            const desiredForceBody = state.worldToBody(desiredForceWorld);
+
+            // DON'T try to control attitude at all - let the coupled torque do what it will
+            // The torque will be τ = k * F (from the allocation matrix)
+            // Request zero torque - the allocation will give us what it can
+            const zeroTorque = Vector3.zero();
+
+            this.drone.setMotorInputsFromWrench(desiredForceBody, zeroTorque);
+            this.updateMotorUI();
+
+        } else if (this.controlMode === ControlMode.ALTERNATING_HOVER) {
+            // ALTERNATING HOVER MODE: Full position + attitude control with alternating handedness
+            // With alternating [1,-1,-1,1] handedness, torque can cancel out during hover
+            // This gives more stable, oscillatory behavior
+
+            // Position control
+            const desiredForceWorld = this.positionController.computeDesiredForce(state);
+            const desiredForceBody = state.worldToBody(desiredForceWorld);
+
+            // Full attitude control - try to maintain upright orientation
+            this.attitudeController.setTargetOrientation(Quaternion.identity());
+            const desiredTorque = this.attitudeController.computeTorque(state);
+
+            this.drone.setMotorInputsFromWrench(desiredForceBody, desiredTorque);
+            this.updateMotorUI();
         }
     }
 
     private updateMotorUI(): void {
         const thrusts = this.drone.state.motorThrusts;
         thrusts.forEach((thrust, i) => {
-            this.uiElements.motorSliders[i].value = thrust.toString();
-            this.uiElements.motorValues[i].textContent = thrust.toFixed(1);
+            // Don't update slider if user is currently dragging it
+            if (this.sliderBeingDragged !== i) {
+                this.uiElements.motorSliders[i].value = thrust.toString();
+                this.uiElements.motorValues[i].textContent = thrust.toFixed(1);
+            }
         });
+    }
+
+    private updateModeUI(): void {
+        // Update mode indicator text
+        const modeNames: Record<ControlMode, string> = {
+            [ControlMode.MANUAL]: 'Manual',
+            [ControlMode.ATTITUDE]: 'Attitude',
+            [ControlMode.POSITION]: 'Position',
+            [ControlMode.HOVER]: 'Hover',
+            [ControlMode.SPINNING_HOVER]: 'Hover',
+            [ControlMode.POSITION_ATTITUDE]: 'Pos+Att',
+            [ControlMode.ALTERNATING_HOVER]: 'Stable'
+        };
+        this.uiElements.modeIndicator.textContent = modeNames[this.controlMode];
+
+        // Update button active states
+        const isHoverMode = this.controlMode === ControlMode.HOVER ||
+                           this.controlMode === ControlMode.SPINNING_HOVER ||
+                           this.controlMode === ControlMode.POSITION;
+        const isAlternatingMode = this.controlMode === ControlMode.ALTERNATING_HOVER;
+        const isPosAttMode = this.controlMode === ControlMode.POSITION_ATTITUDE;
+
+        this.uiElements.hoverBtn.classList.toggle('active', isHoverMode);
+        this.uiElements.manualBtn.classList.toggle('active', isAlternatingMode);
+        this.uiElements.posAttBtn.classList.toggle('active', isPosAttMode);
     }
 
     private updateUI(): void {
@@ -325,7 +471,7 @@ class TetraCopterApp {
     }
 
     private reset(): void {
-        // Reset drone state
+        // Reset drone state (position, velocity, orientation, angular velocity)
         this.drone.reset(
             new Vector3(0, 0, 3),
             Vector3.zero(),
@@ -333,10 +479,11 @@ class TetraCopterApp {
             Vector3.zero()
         );
 
-        // Stay in hover mode (more useful default)
-        this.controlMode = ControlMode.HOVER;
+        // Reset spinning reference tracking
+        this.spinningReferenceAngle = 0;
+        this.estimatedSpinRate = 0;
 
-        // Reset motor controls
+        // Reset motor values
         this.motorThrusts.fill(0);
         this.drone.setMotorInputs(this.motorThrusts);
 
@@ -357,28 +504,67 @@ class TetraCopterApp {
         this.simulationTime = 0;
         this.isPaused = false;
 
-        console.log('Reset - hover mode active');
+        // Keep current mode, don't change it
+        console.log('Reset - physics state cleared');
     }
 
     private enableHoverMode(): void {
+        // HOVER MODE: Symmetric handedness, accepts spin
+        // Set symmetric handedness [1,1,1,1]
+        this.drone.getAllocation().setHandedness(true);
+
         // Set target to current position (or slightly above if near ground)
         const currentPos = this.drone.state.position;
         const targetZ = Math.max(currentPos.z, 1.0);
         this.positionController.setTargetPosition(new Vector3(currentPos.x, currentPos.y, targetZ));
 
-        this.controlMode = ControlMode.HOVER;
-        console.log(`Hover mode enabled. Target: (${currentPos.x.toFixed(2)}, ${currentPos.y.toFixed(2)}, ${targetZ.toFixed(2)})`);
+        this.controlMode = ControlMode.SPINNING_HOVER;
+        this.updateModeUI();
+        console.log(`Hover mode (symmetric handedness, spin-accepting). Target: (${currentPos.x.toFixed(2)}, ${currentPos.y.toFixed(2)}, ${targetZ.toFixed(2)})`);
     }
 
-    private setManualMode(): void {
-        this.controlMode = ControlMode.MANUAL;
-        // Keep current motor values
-        this.motorThrusts = [...this.drone.state.motorThrusts];
-        console.log('Manual mode enabled');
+    private enableAlternatingMode(): void {
+        // STABLE/ALTERNATING MODE: Alternating handedness, full attitude+position control
+        // Set alternating handedness [1,-1,-1,1]
+        this.drone.getAllocation().setHandedness(false);
+
+        // Set target to current position (or slightly above if near ground)
+        const currentPos = this.drone.state.position;
+        const targetZ = Math.max(currentPos.z, 1.0);
+        this.positionController.setTargetPosition(new Vector3(currentPos.x, currentPos.y, targetZ));
+
+        // Set target orientation to identity (upright)
+        this.attitudeController.setTargetOrientation(Quaternion.identity());
+
+        this.controlMode = ControlMode.ALTERNATING_HOVER;
+        this.updateModeUI();
+        console.log(`Stable mode (alternating handedness, full control). Target: (${currentPos.x.toFixed(2)}, ${currentPos.y.toFixed(2)}, ${targetZ.toFixed(2)})`);
+    }
+
+    private enablePositionAttitudeMode(): void {
+        // POSITION+ATTITUDE MODE: Symmetric handedness, position-only control
+        // Set symmetric handedness [1,1,1,1]
+        this.drone.getAllocation().setHandedness(true);
+
+        // Set target to current position (or slightly above if near ground)
+        const currentPos = this.drone.state.position;
+        const targetZ = Math.max(currentPos.z, 1.0);
+        this.positionController.setTargetPosition(new Vector3(currentPos.x, currentPos.y, targetZ));
+
+        // Set target orientation to identity (upright)
+        this.attitudeController.setTargetOrientation(Quaternion.identity());
+
+        this.controlMode = ControlMode.POSITION_ATTITUDE;
+        this.updateModeUI();
+        console.log(`Pos+Att mode (symmetric handedness, position-only). Target: (${currentPos.x.toFixed(2)}, ${currentPos.y.toFixed(2)}, ${targetZ.toFixed(2)})`);
     }
 
     private nudgeTarget(dx: number, dy: number, dz: number): void {
-        if (this.controlMode === ControlMode.HOVER || this.controlMode === ControlMode.POSITION) {
+        if (this.controlMode === ControlMode.HOVER ||
+            this.controlMode === ControlMode.POSITION ||
+            this.controlMode === ControlMode.SPINNING_HOVER ||
+            this.controlMode === ControlMode.POSITION_ATTITUDE ||
+            this.controlMode === ControlMode.ALTERNATING_HOVER) {
             const current = this.positionController.getTargetPosition();
             const newTarget = new Vector3(
                 current.x + dx,
@@ -388,40 +574,6 @@ class TetraCopterApp {
             this.positionController.setTargetPosition(newTarget);
             console.log(`Target moved to: (${newTarget.x.toFixed(2)}, ${newTarget.y.toFixed(2)}, ${newTarget.z.toFixed(2)})`);
         }
-    }
-
-    private startSpin(): void {
-        // Enable hover mode and give it a big angular velocity kick
-        this.enableHoverMode();
-
-        // Add significant angular velocity around body z-axis
-        this.drone.state.angularVelocity.set(0, 0, 8.0);
-        console.log('Spin! Angular velocity kick applied');
-    }
-
-    private startFlip(): void {
-        // Do a flip! Give it angular velocity around x or y axis
-        this.enableHoverMode();
-
-        // Kick it to flip (around body x-axis)
-        this.drone.state.angularVelocity.set(12.0, 0, 0);
-
-        // Also give it a bit of upward velocity to have room for the flip
-        this.drone.state.velocity.z += 3.0;
-
-        console.log('Flip! Good luck little drone!');
-    }
-
-    private handleCrash(): void {
-        console.log('Drone crashed! Press R to reset, or H for hover mode.');
-
-        // Switch to manual and stop motors
-        this.controlMode = ControlMode.MANUAL;
-        this.motorThrusts.fill(0);
-        this.drone.setMotorInputs(this.motorThrusts);
-
-        // Pause simulation
-        this.isPaused = true;
     }
 
     public destroy(): void {

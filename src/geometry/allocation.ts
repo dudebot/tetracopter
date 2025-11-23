@@ -22,6 +22,11 @@ export class AllocationMatrix {
     // Higher k = more torque authority for attitude control
     public k: number = 0.3;
 
+    // Handedness array - determines motor spin directions
+    // Symmetric [1,1,1,1]: all same direction, creates unavoidable yaw torque during hover
+    // Alternating [1,-1,-1,1]: torque cancellation possible, more stable hover
+    private handedness: number[] = [1, 1, 1, 1];
+
     // Motor limits
     public maxThrust: number = 15.0;      // Maximum thrust per motor (N)
     public minThrust: number = -15.0;     // Minimum thrust (reverse)
@@ -37,22 +42,18 @@ export class AllocationMatrix {
      * Build the 6x4 allocation matrix M
      * Maps u = [u1, u2, u3, u4]^T to w_b = [F_b; τ_b]
      *
-     * Column i: [n_i; k_i * n_i]
+     * Column i: [n_i; k * n_i]
      *
-     * Motors have ALTERNATING handedness (like real quadcopter props)
-     * so reaction torques can cancel during hover.
-     * Motors 1,3 spin one way (+k), motors 2,4 spin the other (-k)
+     * Handedness determines torque direction per motor:
+     * - Symmetric [1,1,1,1]: unavoidable yaw torque during hover
+     * - Alternating [1,-1,-1,1]: torque cancellation possible
      */
     private buildAllocationMatrix(): void {
         this.M = new Matrix(6, 4);
 
-        // Alternating signs for motor handedness
-        // Paired by which contribute positive vs negative Z force
-        const handedness = [1, -1, -1, 1];  // Motors 1,4 one way; Motors 2,3 the other
-
         for (let i = 0; i < 4; i++) {
             const n = this.geometry.getThrustAxis(i);
-            const ki = this.k * handedness[i];
+            const ki = this.k * this.handedness[i];
 
             // Top 3 rows: force contribution (n_i)
             this.M.set(0, i, n.x);
@@ -65,7 +66,8 @@ export class AllocationMatrix {
             this.M.set(5, i, ki * n.z);
         }
 
-        console.log('Allocation matrix M (6x4) with alternating handedness:');
+        const handednessType = this.handedness.every(h => h === 1) ? 'SYMMETRIC' : 'ALTERNATING';
+        console.log(`Allocation matrix M (6x4) with ${handednessType} handedness [${this.handedness.join(',')}]:`);
         console.log(this.M.toString());
     }
 
@@ -164,6 +166,24 @@ export class AllocationMatrix {
     }
 
     /**
+     * Set the handedness configuration for motor torque directions.
+     * @param symmetric If true, uses [1,1,1,1] (all same direction, creates yaw torque).
+     *                  If false, uses [1,-1,-1,1] (alternating, allows torque cancellation).
+     */
+    setHandedness(symmetric: boolean): void {
+        this.handedness = symmetric ? [1, 1, 1, 1] : [1, -1, -1, 1];
+        this.buildAllocationMatrix();
+        this.computePseudoinverse();
+    }
+
+    /**
+     * Check if current handedness is symmetric
+     */
+    isSymmetricHandedness(): boolean {
+        return this.handedness.every(h => h === 1);
+    }
+
+    /**
      * Get the allocation matrix
      */
     getAllocationMatrix(): Matrix {
@@ -175,6 +195,32 @@ export class AllocationMatrix {
      */
     getPseudoinverse(): Matrix {
         return this.MPseudoInv.clone();
+    }
+
+    /**
+     * Compute the expected yaw torque from a given set of motor thrusts.
+     * With symmetric handedness, any net thrust produces a net yaw torque.
+     * This is used to predict the spin rate for the spinning reference frame.
+     */
+    computeExpectedYawTorque(thrusts: number[]): number {
+        const wrench = this.computeWrench(thrusts);
+        // For a tetrahedral config with radial thrust axes,
+        // the "yaw" is roughly the component along the body Z axis
+        // But actually the torque is distributed - let's use the magnitude
+        // projected onto the average thrust direction
+        return wrench.torque.z;  // Simplified - actual yaw component
+    }
+
+    /**
+     * Estimate the steady-state yaw rate for hover thrust.
+     * τ = I * α, at steady state τ_external = damping * ω
+     * Without damping, ω grows without bound.
+     * Returns the torque magnitude that would be applied during hover.
+     */
+    getHoverYawTorque(hoverThrust: number): number {
+        // During hover, all motors produce roughly equal thrust
+        const perMotor = hoverThrust / 4;
+        return this.computeExpectedYawTorque([perMotor, perMotor, perMotor, perMotor]);
     }
 
     /**

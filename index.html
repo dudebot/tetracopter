@@ -67,6 +67,16 @@
             font-size: 12px;
         }
 
+        #mode-indicator {
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+
+        #mode-indicator span {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+
         button {
             background: #4CAF50;
             color: white;
@@ -83,6 +93,14 @@
 
         button:active {
             background: #3d8b40;
+        }
+
+        button.active {
+            background: #2196F3;
+        }
+
+        button.active:hover {
+            background: #1976D2;
         }
     </style>
 </head>
@@ -118,10 +136,11 @@
     </div>
 
     <div id="controls">
+        <div id="mode-indicator">Mode: <span id="currentMode">Hover</span></div>
         <button id="resetBtn">Reset</button>
-        <button id="hoverBtn">Hover</button>
-        <button id="spinBtn">Spin</button>
-        <button id="flipBtn">Flip</button>
+        <button id="hoverBtn" class="active">Hover</button>
+        <button id="posAttBtn">Pos+Att</button>
+        <button id="manualBtn">Stable</button>
     </div>
 
     <script type="module" src="/src/main.ts"></script>
